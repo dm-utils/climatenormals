@@ -17,3 +17,7 @@ venv/
 # Downloaded reference data (fetched by scripts, not committed)
 data/raw/
 dev/data/
+
+.vercel
+dev/*.log
+dev/batch_log.txt
