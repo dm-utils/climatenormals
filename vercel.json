@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/normal.py": {
+      "runtime": "python3.12"
+    }
+  }
+}
