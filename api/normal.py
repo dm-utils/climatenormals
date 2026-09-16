@@ -24,7 +24,9 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
+REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
 _normals_cache = None
+_regions_cache = None
 
 
 def load_normals() -> dict:
@@ -32,6 +34,19 @@ def load_normals() -> dict:
     if _normals_cache is None:
         _normals_cache = json.loads(NORMALS_PATH.read_text(encoding="utf-8"))
     return _normals_cache
+
+
+def load_regions() -> list:
+    """The FULL list of all known regions (even ones not computed yet) --
+    nearest-region matching must consider all of them, not just the ones
+    that happen to already have data, or a query near a not-yet-computed
+    region silently snaps to some unrelated region on the other side of
+    the planet that does have data (found the hard way: Sydney matched to
+    Aguascalientes, Mexico, 12,819 km away)."""
+    global _regions_cache
+    if _regions_cache is None:
+        _regions_cache = json.loads(REGIONS_PATH.read_text(encoding="utf-8"))
+    return _regions_cache
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -43,14 +58,13 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def nearest_region(normals: dict, lat: float, lon: float) -> tuple[str, float]:
-    best_id, best_dist = None, float("inf")
-    for region_id, region in normals.items():
-        meta = region["meta"]
-        d = haversine_km(lat, lon, meta["lat"], meta["lon"])
+def nearest_region(regions: list, lat: float, lon: float) -> tuple[dict, float]:
+    best, best_dist = None, float("inf")
+    for region in regions:
+        d = haversine_km(lat, lon, region["lat"], region["lon"])
         if d < best_dist:
-            best_id, best_dist = region_id, d
-    return best_id, best_dist
+            best, best_dist = region, d
+    return best, best_dist
 
 
 def geocode_address(address: str) -> tuple[float, float]:
@@ -86,13 +100,29 @@ class handler(BaseHTTPRequestHandler):
             )
             day_of_year = target_date.timetuple().tm_yday
 
+            regions = load_regions()
+            nearest, distance_km = nearest_region(regions, lat, lon)
+            if nearest is None:
+                self._json_response(404, {"error": "no known region at all (empty regions.json)"})
+                return
+            region_id = nearest["region_id"]
+
             normals = load_normals()
-            region_id, distance_km = nearest_region(normals, lat, lon)
-            region = normals[region_id]
-            day_data = region["days"].get(str(day_of_year))
+            region = normals.get(region_id)
+            day_data = region["days"].get(str(day_of_year)) if region else None
 
             if day_data is None:
-                self._json_response(404, {"error": "no data for this day in the nearest region"})
+                self._json_response(202, {
+                    "region": region_id,
+                    "region_meta": {
+                        "country": nearest["country"], "admin1": nearest["admin1"],
+                        "station": nearest["station"], "station_name": nearest["station_name"],
+                        "lat": nearest["lat"], "lon": nearest["lon"],
+                    },
+                    "distance_to_reference_station_km": round(distance_km, 1),
+                    "error": "this is the correct nearest region, but its data hasn't been "
+                             "computed yet -- the incremental build is still filling in regions",
+                })
                 return
 
             self._json_response(200, {
