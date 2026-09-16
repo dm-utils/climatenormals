@@ -4,10 +4,16 @@ Query params:
   lat, lon        - coordinates (use these, or `address`)
   address         - free-text address, geocoded via TomTom (needs TOMTOM_API_KEY env var)
   date            - YYYY-MM-DD (defaults to today)
+  w_long, w_30, w_10 - optional custom weights (0-1) for the three disjoint
+                    windows (40y+ back / 10-40y back / last 10y). Must sum
+                    to 1. Free to customize: the three components are
+                    stored separately, so a custom blend is just a
+                    different weighted sum of already-cached numbers, no
+                    recomputation needed. Default: 0.20 / 0.35 / 0.45.
 
 Resolves the nearest known region by simple haversine distance to each
 region's reference-station coordinates (no reverse-geocoding product
-needed), then looks up the precomputed blended normal for that
+needed), then looks up the precomputed normal components for that
 day-of-year from normals.json (bundled with the deployment, built by
 dev/build_normals.py).
 """
@@ -23,6 +29,7 @@ from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
+DEFAULT_WEIGHTS = {"p_long": 0.20, "p30": 0.35, "p10": 0.45}
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
 REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
 _normals_cache = None
@@ -67,6 +74,21 @@ def nearest_region(regions: list, lat: float, lon: float) -> tuple[dict, float]:
     return best, best_dist
 
 
+def parse_weights(params: dict) -> dict:
+    if not ({"w_long", "w_30", "w_10"} & params.keys()):
+        return DEFAULT_WEIGHTS
+    try:
+        w_long = float(params.get("w_long", [DEFAULT_WEIGHTS["p_long"]])[0])
+        w_30 = float(params.get("w_30", [DEFAULT_WEIGHTS["p30"]])[0])
+        w_10 = float(params.get("w_10", [DEFAULT_WEIGHTS["p10"]])[0])
+    except ValueError as e:
+        raise ValueError("w_long/w_30/w_10 must be numbers") from e
+    total = w_long + w_30 + w_10
+    if not (0.99 <= total <= 1.01):
+        raise ValueError(f"w_long + w_30 + w_10 must sum to 1 (got {total})")
+    return {"p_long": w_long, "p30": w_30, "p10": w_10}
+
+
 def geocode_address(address: str) -> tuple[float, float]:
     api_key = os.environ["TOMTOM_API_KEY"]
     url = f"https://api.tomtom.com/search/2/geocode/{urllib.parse.quote(address)}.json?key={api_key}&limit=1"
@@ -85,6 +107,12 @@ class handler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
 
         try:
+            try:
+                weights = parse_weights(params)
+            except ValueError as e:
+                self._json_response(400, {"error": str(e)})
+                return
+
             if "lat" in params and "lon" in params:
                 lat, lon = float(params["lat"][0]), float(params["lon"][0])
             elif "address" in params:
@@ -125,12 +153,19 @@ class handler(BaseHTTPRequestHandler):
                 })
                 return
 
+            temp = day_data["temp"]
+            custom_blend = (
+                weights["p_long"] * temp["p_long"]
+                + weights["p30"] * temp["p30"]
+                + weights["p10"] * temp["p10"]
+            )
             self._json_response(200, {
                 "region": region_id,
                 "region_meta": region["meta"],
                 "distance_to_reference_station_km": round(distance_km, 1),
                 "date": target_date.isoformat(),
-                **day_data,
+                "weights_used": weights,
+                "temp": {**temp, "blend": round(custom_blend, 1)},
             })
         except Exception as e:  # noqa: BLE001
             self._json_response(500, {"error": str(e)})

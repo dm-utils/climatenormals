@@ -26,8 +26,15 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 WINDOW_DAYS = 7
-WEIGHTS = {"p100": 0.4, "p30": 0.3, "p10": 0.3}
+WEIGHTS = {"p_long": 0.20, "p30": 0.35, "p10": 0.45}
 TODAY = date(2026, 9, 16)
+
+# Disjoint windows (not nested): p10 = last 10y, p30 = the 30y *before* that
+# (10-40y back), p_long = everything older than 40y back. Each year of
+# history counts toward exactly one component now, not up to three.
+YEARS_RECENT = 10
+YEARS_MID = 40  # p30 covers YEARS_RECENT..YEARS_MID years back
+FETCH_YEARS = YEARS_MID  # Open-Meteo needs to cover both p10 and p30
 
 
 def download_station_csv(station_id: str) -> Path:
@@ -49,24 +56,27 @@ def day_window(target: date, window: int) -> set[tuple[int, int]]:
     return pairs
 
 
-def index_ghcn_csv(csv_path: Path, element: str) -> dict[tuple[int, int], list[float]]:
-    """Read a station CSV once; index values by (month, day) across all years."""
-    index: dict[tuple[int, int], list[float]] = {}
+def index_ghcn_csv(csv_path: Path, element: str) -> dict[tuple[int, int], list[tuple[int, float]]]:
+    """Read a station CSV once; index (year, value) by (month, day)."""
+    index: dict[tuple[int, int], list[tuple[int, float]]] = {}
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row["ELEMENT"] != element or row["Q_FLAG"]:
                 continue
             d = row["DATE"]
-            m, day = int(d[4:6]), int(d[6:8])
-            index.setdefault((m, day), []).append(int(row["DATA_VALUE"]) / 10.0)
+            year, m, day = int(d[0:4]), int(d[4:6]), int(d[6:8])
+            index.setdefault((m, day), []).append((year, int(row["DATA_VALUE"]) / 10.0))
     return index
 
 
-def avg_from_index(index: dict[tuple[int, int], list[float]], wanted: set[tuple[int, int]]):
+def ghcn_avg_before_year(index, wanted: set[tuple[int, int]], cutoff_year: int):
+    """Average of values strictly older than cutoff_year (the disjoint 'long' window)."""
     values = []
     for key in wanted:
-        values.extend(index.get(key, []))
+        for year, value in index.get(key, []):
+            if year < cutoff_year:
+                values.append(value)
     return (sum(values) / len(values)) if values else None
 
 
@@ -103,12 +113,16 @@ def index_openmeteo(daily, key) -> dict[tuple[int, int], list[tuple[date, float]
     return index
 
 
-def recent_avg_from_index(index, wanted: set[tuple[int, int]], cutoff: date):
+def recent_avg_from_index(index, wanted: set[tuple[int, int]], min_date: date, max_date: date | None = None):
+    """Average of values in [min_date, max_date) -- max_date=None means no upper bound."""
     values = []
     for key in wanted:
         for dt, value in index.get(key, []):
-            if dt >= cutoff:
-                values.append(value)
+            if dt < min_date:
+                continue
+            if max_date is not None and dt >= max_date:
+                continue
+            values.append(value)
     return (sum(values) / len(values)) if values else None
 
 
@@ -154,10 +168,10 @@ def main():
     print(f"Resuming: {done_before}/{len(regions)} regions already done. "
           f"Processing up to {args.max} more this run.")
 
-    fetch_start = TODAY.replace(year=TODAY.year - 30)
+    fetch_start = TODAY.replace(year=TODAY.year - FETCH_YEARS)
     days = all_days_of_year()
-    cutoff30 = TODAY.replace(year=TODAY.year - 30)
-    cutoff10 = TODAY.replace(year=TODAY.year - 10)
+    cutoff_recent = TODAY.replace(year=TODAY.year - YEARS_RECENT)  # p10 lower bound
+    cutoff_mid = TODAY.replace(year=TODAY.year - YEARS_MID)  # p30 lower bound / p_long upper bound
 
     processed_this_run = 0
     for i, region in enumerate(regions):
@@ -181,12 +195,13 @@ def main():
             for target in days:
                 doy = target.timetuple().tm_yday
                 wanted = day_window(target, WINDOW_DAYS)
-                long_avg = avg_from_index(long_index, wanted)
-                avg30 = recent_avg_from_index(recent_index, wanted, cutoff30)
-                avg10 = recent_avg_from_index(recent_index, wanted, cutoff10)
+                # disjoint: p10 = last 10y, p30 = 10-40y back, p_long = 40y+ back
+                long_avg = ghcn_avg_before_year(long_index, wanted, cutoff_mid.year)
+                avg30 = recent_avg_from_index(recent_index, wanted, cutoff_mid, cutoff_recent)
+                avg10 = recent_avg_from_index(recent_index, wanted, cutoff_recent)
                 if long_avg is None or avg30 is None or avg10 is None:
                     continue
-                blend = WEIGHTS["p100"] * long_avg + WEIGHTS["p30"] * avg30 + WEIGHTS["p10"] * avg10
+                blend = WEIGHTS["p_long"] * long_avg + WEIGHTS["p30"] * avg30 + WEIGHTS["p10"] * avg10
                 region_normals[str(doy)] = {
                     "temp": {
                         "p_long": round(long_avg, 1),
