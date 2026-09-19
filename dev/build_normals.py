@@ -1,6 +1,6 @@
 """Generalized version of pilot_normals.py: computes the blended climate
-normal (temperature, for now) for every region in regions.json, for all 366
-days of the year, and writes normals.json.
+normal (temperature, precipitation, wind) for every region in regions.json,
+for all 366 days of the year, and writes normals.json.
 
 Usage: python dev/build_normals.py path/to/regions.json
 """
@@ -34,7 +34,16 @@ TODAY = date(2026, 9, 16)
 # history counts toward exactly one component now, not up to three.
 YEARS_RECENT = 10
 YEARS_MID = 40  # p30 covers YEARS_RECENT..YEARS_MID years back
-FETCH_YEARS = YEARS_MID  # Open-Meteo needs to cover both p10 and p30
+# Temperature's p_long comes from GHCN (often 100+ years of per-station
+# history, see ghcn_avg_before_year below); precip/wind have no GHCN path
+# here (AWND wind coverage in GHCN is too sparse historically to trust),
+# so their own p_long comes from this same Open-Meteo fetch instead --
+# needs to reach past YEARS_MID or that bucket would be empty. Deliberately
+# NOT widened to GHCN-like depth: every extra year here multiplies
+# Open-Meteo's per-request cost, on top of the ~3x from adding
+# precipitation_sum + wind_speed_10m_max to the same request (this build
+# already hit Open-Meteo's daily quota once with 1 variable/40y).
+FETCH_YEARS = 55
 
 
 def download_station_csv(station_id: str) -> Path:
@@ -81,14 +90,17 @@ def ghcn_avg_before_year(index, wanted: set[tuple[int, int]], cutoff_year: int):
 
 
 def fetch_openmeteo(lat: float, lon: float, start: date, end: date, retries=3):
-    # Only temperature_2m_max: that's the only variable the calculation uses,
-    # and Open-Meteo appears to weight request cost by variables x date-range
-    # (a 30y range already made us hit the hourly quota fast) -- fetching an
-    # unused second variable was silently doubling that cost for nothing.
+    # temperature_2m_max, precipitation_sum, wind_speed_10m_max. Open-Meteo
+    # appears to weight request cost by variables x date-range (a 30y range
+    # already made us hit the daily quota once with a single variable) --
+    # three variables over FETCH_YEARS is a real, deliberate cost increase,
+    # not an oversight; if the daily quota starts getting hit again during
+    # the precip/wind backfill, dial back FETCH_YEARS or --max before
+    # assuming something else is wrong.
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}&start_date={start.isoformat()}&end_date={end.isoformat()}"
-        "&daily=temperature_2m_max&timezone=UTC"
+        "&daily=temperature_2m_max,precipitation_sum,wind_speed_10m_max&timezone=UTC"
     )
     for attempt in range(retries):
         try:
@@ -135,6 +147,16 @@ def all_days_of_year() -> list[date]:
     return days
 
 
+def region_needs_backfill(entry: dict) -> bool:
+    """True if this region's data predates the precip/wind addition (or is
+    otherwise incomplete) and should be reprocessed."""
+    days = entry.get("days") or {}
+    if not days:
+        return True
+    sample = next(iter(days.values()))
+    return "precip" not in sample or "wind" not in sample
+
+
 def save(normals: dict, out_path: Path) -> None:
     out_path.write_text(json.dumps(normals, ensure_ascii=False), encoding="utf-8")
 
@@ -164,8 +186,9 @@ def main():
 
     out_path = repo_root / "normals.json"
     normals = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
-    done_before = len(normals)
-    print(f"Resuming: {done_before}/{len(regions)} regions already done. "
+    done_before = sum(1 for entry in normals.values() if not region_needs_backfill(entry))
+    print(f"Resuming: {done_before}/{len(regions)} regions fully done "
+          f"(temp+precip+wind), {len(normals)} have at least temp. "
           f"Processing up to {args.max} more this run.")
 
     fetch_start = TODAY.replace(year=TODAY.year - FETCH_YEARS)
@@ -179,7 +202,7 @@ def main():
             print(f"Reached --max {args.max} for this run, stopping.")
             break
         rid = region["region_id"]
-        if rid in normals:
+        if rid in normals and not region_needs_backfill(normals[rid]):
             continue
         processed_this_run += 1
         print(f"[{i + 1}/{len(regions)}] {rid} ({region['station_name']})...", flush=True)
@@ -190,6 +213,8 @@ def main():
 
             long_index = index_ghcn_csv(csv_path, "TMAX")
             recent_index = index_openmeteo(daily, "temperature_2m_max")
+            precip_index = index_openmeteo(daily, "precipitation_sum")
+            wind_index = index_openmeteo(daily, "wind_speed_10m_max")
 
             region_normals = {}
             for target in days:
@@ -202,7 +227,7 @@ def main():
                 if long_avg is None or avg30 is None or avg10 is None:
                     continue
                 blend = WEIGHTS["p_long"] * long_avg + WEIGHTS["p30"] * avg30 + WEIGHTS["p10"] * avg10
-                region_normals[str(doy)] = {
+                day_entry = {
                     "temp": {
                         "p_long": round(long_avg, 1),
                         "p30": round(avg30, 1),
@@ -210,6 +235,27 @@ def main():
                         "blend": round(blend, 1),
                     }
                 }
+
+                # precip/wind: same disjoint scheme, but all three windows
+                # come from this one Open-Meteo fetch (no GHCN path) -- so
+                # p_long here means "cutoff_mid..fetch_start years back"
+                # (FETCH_YEARS-40, e.g. 40-55y), not GHCN's often much
+                # longer unbounded history like temperature's p_long.
+                for var_name, index in (("precip", precip_index), ("wind", wind_index)):
+                    v_long = recent_avg_from_index(index, wanted, fetch_start, cutoff_mid)
+                    v30 = recent_avg_from_index(index, wanted, cutoff_mid, cutoff_recent)
+                    v10 = recent_avg_from_index(index, wanted, cutoff_recent)
+                    if v_long is None or v30 is None or v10 is None:
+                        continue
+                    v_blend = WEIGHTS["p_long"] * v_long + WEIGHTS["p30"] * v30 + WEIGHTS["p10"] * v10
+                    day_entry[var_name] = {
+                        "p_long": round(v_long, 1),
+                        "p30": round(v30, 1),
+                        "p10": round(v10, 1),
+                        "blend": round(v_blend, 1),
+                    }
+
+                region_normals[str(doy)] = day_entry
             normals[rid] = {
                 "meta": {
                     "country": region["country"], "admin1": region["admin1"],
@@ -227,13 +273,14 @@ def main():
             save(normals, out_path)  # checkpoint periodically, not just at the very end
 
     save(normals, out_path)
+    done_after = sum(1 for entry in normals.values() if not region_needs_backfill(entry))
     print(f"\nWrote {out_path} ({out_path.stat().st_size / 1024:.0f} KB, "
-          f"{len(normals)}/{len(regions)} regions total, {processed_this_run} done this run)")
+          f"{done_after}/{len(regions)} regions fully done, {processed_this_run} done this run)")
 
     if not args.no_git and processed_this_run > 0:
         git_commit_and_push(
             repo_root,
-            f"Add {processed_this_run} more region normals ({len(normals)}/{len(regions)} total)",
+            f"Backfill precip/wind for {processed_this_run} more regions ({done_after}/{len(regions)} fully done)",
         )
 
 

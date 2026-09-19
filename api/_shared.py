@@ -98,9 +98,10 @@ def geocode_cache_set(address: str, lat: float, lon: float) -> None:
 
 
 def get_forecast(region_id: str, lat: float, lon: float) -> dict | None:
-    """Returns {iso_date: temp_max} for the next ~14 days for this region's
-    reference-station coordinates, or None if unavailable (Open-Meteo
-    down/quota, or Redis + Open-Meteo both failing).
+    """Returns {iso_date: {"temp": .., "precip": .., "wind": ..}} for the
+    next ~14 days for this region's reference-station coordinates, or None
+    if unavailable (Open-Meteo down/quota, or Redis + Open-Meteo both
+    failing). A day's entry omits a variable Open-Meteo returned null for.
 
     Cached per REGION (not per exact address/coordinates) so the cache
     stays bounded to the known region count and a burst of different
@@ -109,8 +110,15 @@ def get_forecast(region_id: str, lat: float, lon: float) -> dict | None:
     cached = _redis("GET", cache_key)
     if cached:
         try:
-            return json.loads(cached)
-        except (ValueError, TypeError):
+            parsed = json.loads(cached)
+            # Self-heal across cache-shape changes (this one went from
+            # {date: temp_float} to {date: {"temp":..,"precip":..,"wind":..}}):
+            # a value that isn't a dict means a stale pre-change entry is
+            # still within its TTL -- treat it as a miss and refetch rather
+            # than erroring deep in the caller on the next request.
+            if not parsed or all(isinstance(v, dict) for v in parsed.values()):
+                return parsed
+        except (ValueError, TypeError, AttributeError):
             pass  # fall through and refetch
 
     # forecast_days=16 (Open-Meteo's max for the free tier) so "day 14"
@@ -118,7 +126,8 @@ def get_forecast(region_id: str, lat: float, lon: float) -> dict | None:
     # today plus N-1 more days, so N=14 would stop one day short of it.
     url = (
         "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}&daily=temperature_2m_max"
+        f"?latitude={lat}&longitude={lon}"
+        "&daily=temperature_2m_max,precipitation_sum,wind_speed_10m_max"
         "&forecast_days=16&timezone=UTC"
     )
     try:
@@ -127,8 +136,15 @@ def get_forecast(region_id: str, lat: float, lon: float) -> dict | None:
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError):
         return None
 
-    forecast = {
-        d: v for d, v in zip(daily["time"], daily["temperature_2m_max"]) if v is not None
-    }
+    forecast = {}
+    for i, d in enumerate(daily["time"]):
+        entry = {}
+        for key, field in (("temp", "temperature_2m_max"), ("precip", "precipitation_sum"), ("wind", "wind_speed_10m_max")):
+            v = daily.get(field, [None] * len(daily["time"]))[i]
+            if v is not None:
+                entry[key] = v
+        if entry:
+            forecast[d] = entry
+
     _redis("SET", cache_key, json.dumps(forecast), "EX", str(FORECAST_CACHE_TTL_SECONDS))
     return forecast

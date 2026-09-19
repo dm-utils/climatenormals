@@ -16,6 +16,11 @@ region's reference-station coordinates (no reverse-geocoding product
 needed), then looks up the precomputed normal components for that
 day-of-year from normals.json (bundled with the deployment, built by
 dev/build_normals.py).
+
+Response includes "temp" (deg C) always, plus "precip" (mm) and "wind"
+(km/h, max daily) once this region's backfill has reached them -- omitted
+entirely for regions still pending (see region_needs_backfill in
+dev/build_normals.py). Same w_long/w_30/w_10 weights apply to all three.
 """
 
 from __future__ import annotations
@@ -102,15 +107,25 @@ def trend_weight(horizon_days: int) -> float:
     return TREND_WEIGHT_AT_15 * math.exp(-(horizon_days - 15) / TREND_DECAY_TAU)
 
 
-def region_blend_for_date(region: dict, d: date, weights: dict) -> float | None:
-    """Climate-normal blend for an arbitrary date within the same region,
-    using the same (possibly custom) weights as the main request -- used
-    to compute how far the recent forecast deviates from normal."""
+def variable_blend(day_data: dict, var: str, weights: dict) -> float | None:
+    """Climate-normal blend for one variable ("temp"/"precip"/"wind") in an
+    already-resolved day entry. None if this region/day doesn't have that
+    variable yet (precip/wind backfill is still in progress for some
+    regions; temp has been complete since the original build)."""
+    v = day_data.get(var)
+    if v is None:
+        return None
+    return weights["p_long"] * v["p_long"] + weights["p30"] * v["p30"] + weights["p10"] * v["p10"]
+
+
+def region_blend_for_date(region: dict, d: date, weights: dict, var: str = "temp") -> float | None:
+    """Same as variable_blend, but looks up an arbitrary date within the
+    same region first -- used to compute how far the recent forecast
+    deviates from normal, for dates other than the one being requested."""
     day_data = region["days"].get(str(d.timetuple().tm_yday))
     if day_data is None:
         return None
-    t = day_data["temp"]
-    return weights["p_long"] * t["p_long"] + weights["p30"] * t["p30"] + weights["p10"] * t["p10"]
+    return variable_blend(day_data, var, weights)
 
 
 def parse_weights(params: dict) -> dict:
@@ -206,33 +221,55 @@ class handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            temp = day_data["temp"]
-            custom_blend = (
-                weights["p_long"] * temp["p_long"]
-                + weights["p30"] * temp["p30"]
-                + weights["p10"] * temp["p10"]
-            )
-            resp_temp = {**temp, "blend": round(custom_blend, 1)}
+            custom_blend = variable_blend(day_data, "temp", weights)
+            resp_temp = {**day_data["temp"], "blend": round(custom_blend, 1)}
             forecast_trend = None
+
+            # precip/wind: same climate-normal blend as temp, but only when
+            # this region's backfill (see dev/build_normals.py) has reached
+            # them yet -- None means "not there yet", field omitted below.
+            resp_precip = None
+            precip_blend = variable_blend(day_data, "precip", weights)
+            if precip_blend is not None:
+                resp_precip = {**day_data["precip"], "blend": round(precip_blend, 1)}
+
+            resp_wind = None
+            wind_blend = variable_blend(day_data, "wind", weights)
+            if wind_blend is not None:
+                resp_wind = {**day_data["wind"], "blend": round(wind_blend, 1)}
 
             horizon_days = (target_date - date.today()).days
             if 0 <= horizon_days <= TREND_ZONE_END_DAYS:
                 forecast = get_forecast(region_id, nearest["lat"], nearest["lon"])
                 if forecast is not None:
                     if horizon_days <= FORECAST_HORIZON_DAYS:
-                        raw = forecast.get(target_date.isoformat())
-                        if raw is not None:
-                            resp_temp["forecast_adjusted"] = round(raw, 1)
-                            forecast_trend = {
-                                "method": "raw_forecast", "horizon_days": horizon_days,
-                                "trend_weight": 1.0,
-                            }
-                    else:  # 15..30: nudge the climate normal by the recent forecast trend
+                        # 0-14 days: real forecast, pass through as-is for
+                        # every variable that has both forecast + normal data.
+                        fc = forecast.get(target_date.isoformat())
+                        if fc is not None:
+                            if "temp" in fc:
+                                resp_temp["forecast_adjusted"] = round(fc["temp"], 1)
+                                forecast_trend = {
+                                    "method": "raw_forecast", "horizon_days": horizon_days,
+                                    "trend_weight": 1.0,
+                                }
+                            if resp_precip is not None and "precip" in fc:
+                                resp_precip["forecast_adjusted"] = round(fc["precip"], 1)
+                            if resp_wind is not None and "wind" in fc:
+                                resp_wind["forecast_adjusted"] = round(fc["wind"], 1)
+                    else:
+                        # 15-30 days: trend/anomaly persistence nudge --
+                        # temperature only (see module docstring). Precip is
+                        # far too day-to-day chaotic for "current trend
+                        # persists, fading out" to carry real signal the way
+                        # it does for temperature, so precip/wind just keep
+                        # their plain climate blend from above, unnudged.
                         anomalies = []
                         for offset in range(8, 15):
                             d = date.today() + timedelta(days=offset)
-                            fc_temp = forecast.get(d.isoformat())
-                            normal_temp = region_blend_for_date(region, d, weights)
+                            fc = forecast.get(d.isoformat())
+                            fc_temp = fc.get("temp") if fc else None
+                            normal_temp = region_blend_for_date(region, d, weights, "temp")
                             if fc_temp is not None and normal_temp is not None:
                                 anomalies.append(fc_temp - normal_temp)
                         if anomalies:
@@ -254,6 +291,10 @@ class handler(BaseHTTPRequestHandler):
                 "weights_used": weights,
                 "temp": resp_temp,
             }
+            if resp_precip is not None:
+                body["precip"] = resp_precip
+            if resp_wind is not None:
+                body["wind"] = resp_wind
             if forecast_trend is not None:
                 body["forecast_trend"] = forecast_trend
             self._json_response(200, body, cache=True)
