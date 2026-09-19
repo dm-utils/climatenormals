@@ -26,7 +26,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -34,12 +34,22 @@ from pathlib import Path
 # directory isn't on sys.path by default, so a sibling import needs a
 # manual nudge.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _shared import check_rate_limit, client_ip, geocode_cache_get, geocode_cache_set  # noqa: E402
+from _shared import check_rate_limit, client_ip, geocode_cache_get, geocode_cache_set, get_forecast  # noqa: E402
 
 DEFAULT_WEIGHTS = {"p_long": 0.20, "p30": 0.35, "p10": 0.45}
 # Cached normals only change when the (now-complete) build re-runs, which
 # is rare -- safe to let Vercel's CDN absorb repeat identical queries.
 CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+
+# Day 15-30 "trend/anomaly persistence" blend: nudge the climate normal by
+# the recent forecast's deviation from normal, fading the nudge out as the
+# forecast signal gets less trustworthy. A real, named technique in
+# subseasonal forecasting (e.g. NOAA CPC's 3-4 week outlooks) -- not a
+# substitute for an actual forecast, but more grounded than pure guessing.
+FORECAST_HORIZON_DAYS = 14  # 0-14: real Open-Meteo forecast, no blending
+TREND_ZONE_END_DAYS = 30  # 15-30: trend-nudged climate normal
+TREND_WEIGHT_AT_15 = 0.30
+TREND_DECAY_TAU = 6.5  # weight(30) ~= 0.03 with these two constants
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
 REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
 _normals_cache = None
@@ -82,6 +92,25 @@ def nearest_region(regions: list, lat: float, lon: float) -> tuple[dict, float]:
         if d < best_dist:
             best, best_dist = region, d
     return best, best_dist
+
+
+def trend_weight(horizon_days: int) -> float:
+    """0 outside [15, 30]; decays from TREND_WEIGHT_AT_15 at day 15 to
+    ~3% of that at day 30 (see module docstring above)."""
+    if horizon_days < 15 or horizon_days > TREND_ZONE_END_DAYS:
+        return 0.0
+    return TREND_WEIGHT_AT_15 * math.exp(-(horizon_days - 15) / TREND_DECAY_TAU)
+
+
+def region_blend_for_date(region: dict, d: date, weights: dict) -> float | None:
+    """Climate-normal blend for an arbitrary date within the same region,
+    using the same (possibly custom) weights as the main request -- used
+    to compute how far the recent forecast deviates from normal."""
+    day_data = region["days"].get(str(d.timetuple().tm_yday))
+    if day_data is None:
+        return None
+    t = day_data["temp"]
+    return weights["p_long"] * t["p_long"] + weights["p30"] * t["p30"] + weights["p10"] * t["p10"]
 
 
 def parse_weights(params: dict) -> dict:
@@ -183,14 +212,51 @@ class handler(BaseHTTPRequestHandler):
                 + weights["p30"] * temp["p30"]
                 + weights["p10"] * temp["p10"]
             )
-            self._json_response(200, {
+            resp_temp = {**temp, "blend": round(custom_blend, 1)}
+            forecast_trend = None
+
+            horizon_days = (target_date - date.today()).days
+            if 0 <= horizon_days <= TREND_ZONE_END_DAYS:
+                forecast = get_forecast(region_id, nearest["lat"], nearest["lon"])
+                if forecast is not None:
+                    if horizon_days <= FORECAST_HORIZON_DAYS:
+                        raw = forecast.get(target_date.isoformat())
+                        if raw is not None:
+                            resp_temp["forecast_adjusted"] = round(raw, 1)
+                            forecast_trend = {
+                                "method": "raw_forecast", "horizon_days": horizon_days,
+                                "trend_weight": 1.0,
+                            }
+                    else:  # 15..30: nudge the climate normal by the recent forecast trend
+                        anomalies = []
+                        for offset in range(8, 15):
+                            d = date.today() + timedelta(days=offset)
+                            fc_temp = forecast.get(d.isoformat())
+                            normal_temp = region_blend_for_date(region, d, weights)
+                            if fc_temp is not None and normal_temp is not None:
+                                anomalies.append(fc_temp - normal_temp)
+                        if anomalies:
+                            anomaly_c = sum(anomalies) / len(anomalies)
+                            w = trend_weight(horizon_days)
+                            resp_temp["forecast_adjusted"] = round(custom_blend + w * anomaly_c, 1)
+                            forecast_trend = {
+                                "method": "trend_blend", "horizon_days": horizon_days,
+                                "trend_weight": round(w, 3), "anomaly_c": round(anomaly_c, 1),
+                            }
+                # forecast is None (Open-Meteo/Redis unavailable): silently fall back to
+                # the plain climate-normal response above -- no forecast_trend, no error.
+
+            body = {
                 "region": region_id,
                 "region_meta": region["meta"],
                 "distance_to_reference_station_km": round(distance_km, 1),
                 "date": target_date.isoformat(),
                 "weights_used": weights,
-                "temp": {**temp, "blend": round(custom_blend, 1)},
-            }, cache=True)
+                "temp": resp_temp,
+            }
+            if forecast_trend is not None:
+                body["forecast_trend"] = forecast_trend
+            self._json_response(200, body, cache=True)
         except Exception as e:  # noqa: BLE001
             self._json_response(500, {"error": str(e)})
 

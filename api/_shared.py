@@ -6,21 +6,26 @@ into its own endpoint -- it's a plain importable module for normal.py
 
 Uses Upstash Redis (via its REST API, no client library needed -- same
 "plain urllib call" style as the TomTom geocoding call in normal.py) for
-two things that need to survive across serverless invocations, which
+things that need to survive across serverless invocations, which
 in-memory state cannot:
   - a long-lived cache of address -> (lat, lon) geocode results, so a
     repeated address never re-hits TomTom's paid API
   - a simple fixed-window per-IP request counter, as a rate-limit backstop
+  - a short-lived cache of each region's Open-Meteo forecast, so the
+    day-15-30 trend blend doesn't refetch per request (same quota risk as
+    the archive API in dev/build_normals.py -- cached from day one here)
 
-Both fail OPEN: if Redis is unreachable or misconfigured, requests are
-still served (uncached / unlimited) rather than breaking the API. A
-degraded safety net is better than an outage caused by the safety net.
+All fail OPEN: if Redis or Open-Meteo is unreachable, requests are still
+served (uncached / unlimited / without the trend blend) rather than
+breaking the API. A degraded safety net is better than an outage caused by
+the safety net.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 _KV_URL = os.environ.get("KV_REST_API_URL")
@@ -29,6 +34,7 @@ _KV_TOKEN = os.environ.get("KV_REST_API_TOKEN")
 RATE_LIMIT_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW_SECONDS = 60
 GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+FORECAST_CACHE_TTL_SECONDS = 12 * 3600  # 12 hours
 
 
 def _redis(*command: str):
@@ -89,3 +95,40 @@ def geocode_cache_set(address: str, lat: float, lon: float) -> None:
         "SET", f"geocode:{address.strip().lower()}", f"{lat},{lon}",
         "EX", str(GEOCODE_CACHE_TTL_SECONDS),
     )
+
+
+def get_forecast(region_id: str, lat: float, lon: float) -> dict | None:
+    """Returns {iso_date: temp_max} for the next ~14 days for this region's
+    reference-station coordinates, or None if unavailable (Open-Meteo
+    down/quota, or Redis + Open-Meteo both failing).
+
+    Cached per REGION (not per exact address/coordinates) so the cache
+    stays bounded to the known region count and a burst of different
+    addresses resolving to the same region shares one cache entry."""
+    cache_key = f"forecast:{region_id}"
+    cached = _redis("GET", cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except (ValueError, TypeError):
+            pass  # fall through and refetch
+
+    # forecast_days=16 (Open-Meteo's max for the free tier) so "day 14"
+    # (today + 14, inclusive) is actually covered -- forecast_days=N returns
+    # today plus N-1 more days, so N=14 would stop one day short of it.
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}&daily=temperature_2m_max"
+        "&forecast_days=16&timezone=UTC"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            daily = json.load(resp)["daily"]
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError):
+        return None
+
+    forecast = {
+        d: v for d, v in zip(daily["time"], daily["temperature_2m_max"]) if v is not None
+    }
+    _redis("SET", cache_key, json.dumps(forecast), "EX", str(FORECAST_CACHE_TTL_SECONDS))
+    return forecast
