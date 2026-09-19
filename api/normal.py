@@ -23,13 +23,23 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import urllib.parse
 import urllib.request
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
+# Vercel's Python runtime imports this file in isolation -- its own
+# directory isn't on sys.path by default, so a sibling import needs a
+# manual nudge.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _shared import check_rate_limit, client_ip, geocode_cache_get, geocode_cache_set  # noqa: E402
+
 DEFAULT_WEIGHTS = {"p_long": 0.20, "p30": 0.35, "p10": 0.45}
+# Cached normals only change when the (now-complete) build re-runs, which
+# is rare -- safe to let Vercel's CDN absorb repeat identical queries.
+CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
 REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
 _normals_cache = None
@@ -90,6 +100,10 @@ def parse_weights(params: dict) -> dict:
 
 
 def geocode_address(address: str) -> tuple[float, float]:
+    cached = geocode_cache_get(address)
+    if cached is not None:
+        return cached
+
     api_key = os.environ["TOMTOM_API_KEY"]
     url = f"https://api.tomtom.com/search/2/geocode/{urllib.parse.quote(address)}.json?key={api_key}&limit=1"
     with urllib.request.urlopen(url, timeout=10) as resp:
@@ -98,13 +112,23 @@ def geocode_address(address: str) -> tuple[float, float]:
     if not results:
         raise ValueError(f"No geocode result for: {address}")
     pos = results[0]["position"]
-    return pos["lat"], pos["lon"]
+    lat, lon = pos["lat"], pos["lon"]
+    geocode_cache_set(address, lat, lon)
+    return lat, lon
 
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+
+        if not check_rate_limit(client_ip(self.headers)):
+            self._json_response(429, {
+                "error": "Rate limit exceeded (max 60 requests/minute per IP).",
+                "contact": "Need a higher limit for a legitimate use case? "
+                           "Get in touch via https://datamodder.com/contact and we'll work something out.",
+            }, retry_after=60)
+            return
 
         try:
             try:
@@ -166,15 +190,19 @@ class handler(BaseHTTPRequestHandler):
                 "date": target_date.isoformat(),
                 "weights_used": weights,
                 "temp": {**temp, "blend": round(custom_blend, 1)},
-            })
+            }, cache=True)
         except Exception as e:  # noqa: BLE001
             self._json_response(500, {"error": str(e)})
 
-    def _json_response(self, status: int, body: dict):
+    def _json_response(self, status: int, body: dict, cache: bool = False, retry_after: int | None = None):
         payload = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(payload)))
+        if cache:
+            self.send_header("Cache-Control", CACHE_CONTROL)
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         self.end_headers()
         self.wfile.write(payload)

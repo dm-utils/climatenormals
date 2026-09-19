@@ -15,12 +15,28 @@ from pathlib import Path
 
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
 REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
+_regions_cache = None
+_normals_cache = None
+
+
+def load_regions() -> list:
+    global _regions_cache
+    if _regions_cache is None:
+        _regions_cache = json.loads(REGIONS_PATH.read_text(encoding="utf-8"))
+    return _regions_cache
+
+
+def load_normals() -> dict:
+    global _normals_cache
+    if _normals_cache is None:
+        _normals_cache = json.loads(NORMALS_PATH.read_text(encoding="utf-8")) if NORMALS_PATH.exists() else {}
+    return _normals_cache
 
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        regions = json.loads(REGIONS_PATH.read_text(encoding="utf-8"))
-        normals = json.loads(NORMALS_PATH.read_text(encoding="utf-8")) if NORMALS_PATH.exists() else {}
+        regions = load_regions()
+        normals = load_normals()
 
         total_by_country = Counter(r["country"] for r in regions)
         done_by_country = Counter(
@@ -43,5 +59,6 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "public, max-age=300")
         self.end_headers()
         self.wfile.write(payload)

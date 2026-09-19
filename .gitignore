@@ -21,3 +21,5 @@ dev/data/
 .vercel
 dev/*.log
 dev/batch_log.txt
+
+.env*
