@@ -23,4 +23,3 @@ dev/*.log
 dev/batch_log.txt
 
 .env*
-DESIGN.md
