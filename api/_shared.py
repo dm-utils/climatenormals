@@ -23,6 +23,7 @@ the safety net.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import urllib.error
@@ -55,10 +56,29 @@ def _redis(*command: str):
         return None
 
 
+# With API_KEYS set (comma-separated), only callers sending one of them as
+# X-Api-Key get an answer: the API is then for our own sites, which call it
+# from their servers. Without it, anyone may use it.
+API_KEYS = [k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()]
+
+
+def authorized(headers) -> bool:
+    if not API_KEYS:
+        return True
+    given = headers.get("x-api-key") or headers.get("X-Api-Key") or ""
+    return any(hmac.compare_digest(given, key) for key in API_KEYS)
+
+
 def client_ip(headers) -> str:
     """Best-effort client IP from the headers Vercel's edge sets. Falls
     back to a constant so a missing header degrades to "one shared
-    bucket" rather than crashing."""
+    bucket" rather than crashing. A site calling with a key passes on its
+    visitor's address as X-Client-IP, so the limit stays per visitor
+    instead of one bucket for the whole site."""
+    if API_KEYS:
+        visitor = headers.get("x-client-ip") or headers.get("X-Client-IP")
+        if visitor:
+            return visitor.strip()
     forwarded = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()

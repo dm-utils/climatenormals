@@ -5,8 +5,7 @@ location and date, blends three lookback windows (long-term/30y/10y, weighted
 40/30/30 by default) into one forecast — instead of the usual 10-14 day
 forecast horizon.
 
-Live: **https://climatenormals.vercel.app** (API) · website page at
-[datamodder.com/utils/climate-forecast](https://datamodder.com/utils/climate-forecast).
+The data behind [typicalweather.com](https://typicalweather.com).
 
 Data sources:
 
@@ -27,10 +26,16 @@ computes **all 366 days of the year** from that same in-memory data (the
 network fetch is the expensive/rate-limited part; once you have the data,
 computing every day instead of just one is nearly free). Results are cached
 in `normals.json`, committed to this repo and bundled with the Vercel
-deployment — `api/normal.py` just does a nearest-region lookup (haversine
+deployment — `api/normal.py` finds the nearest reference stations (haversine
 against every known region's coordinates, not only the ones already
-computed — see the fix in that file's history) and a dict lookup, no live
-external calls on the request path at all.
+computed — see the fix in that file's history) and averages up to three of
+them within 300 km, nearer ones counting more (1/distance²); no live
+external calls on the request path for the normals themselves.
+
+Why average: tested leave-one-out on the stations themselves, the weighted
+average of the three nearest is off by 1.5 °C on average against 1.8 °C for
+the nearest alone, and for a place between two stations by 1.0 °C against
+1.8 °C.
 
 **Why not fetch live per request?** Considered and rejected: Open-Meteo's
 free tier rate-limited us hard (a single 30-year/1-location request appears
@@ -51,11 +56,16 @@ Check progress any time: `GET /api/status` (or `dev/batch_log.txt` locally).
 
 ## API
 
-- `GET /api/normal?lat=&lon=&date=` or `?address=&date=` — nearest-region
-  climate normal for that date. Returns `200` with the blended forecast, or
-  `202` with the correctly-identified region if that region hasn't been
-  computed yet (never silently substitutes a wrong region).
+- `GET /api/normal?lat=&lon=&date=` or `?address=&date=` — the climate normal
+  for that place and date, averaged over the nearest stations (listed in
+  `stations`, with their weights). Returns `200`, or `202` with the
+  correctly-identified nearest region if that region hasn't been computed
+  yet (never silently substitutes a wrong region).
 - `GET /api/status` — build progress, overall and per country.
+
+The API is not public: with `API_KEYS` set (comma-separated), calls need one
+of them in an `X-Api-Key` header. A site calling from its server passes its
+visitor's address as `X-Client-IP`, so the rate limit stays per visitor.
 
 ## License
 

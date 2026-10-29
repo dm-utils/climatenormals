@@ -39,12 +39,22 @@ from pathlib import Path
 # directory isn't on sys.path by default, so a sibling import needs a
 # manual nudge.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _shared import check_rate_limit, client_ip, geocode_cache_get, geocode_cache_set, get_forecast  # noqa: E402
+from _shared import API_KEYS, authorized, check_rate_limit, client_ip, geocode_cache_get, geocode_cache_set, get_forecast  # noqa: E402
 
 DEFAULT_WEIGHTS = {"p_long": 0.20, "p30": 0.35, "p10": 0.45}
 # Cached normals only change when the (now-complete) build re-runs, which
 # is rare -- safe to let Vercel's CDN absorb repeat identical queries.
 CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+# With keys, the CDN may not keep answers: it would hand them to callers without a key.
+PRIVATE_CACHE_CONTROL = "private, max-age=3600"
+
+# A place's normals are the weighted average of up to BLEND_STATIONS reference
+# stations within BLEND_KM, nearer ones counting more (1/distance^2); the
+# nearest always counts. Tested leave-one-out on the stations themselves: the
+# average of the three nearest is off by 1.5 C on average against 1.8 C for
+# the nearest alone, and for a place between two stations by 1.0 C against 1.8 C.
+BLEND_STATIONS = 3
+BLEND_KM = 300
 
 # Day 15-30 "trend/anomaly persistence" blend: nudge the climate normal by
 # the recent forecast's deviation from normal, fading the nudge out as the
@@ -90,13 +100,37 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def nearest_region(regions: list, lat: float, lon: float) -> tuple[dict, float]:
-    best, best_dist = None, float("inf")
-    for region in regions:
-        d = haversine_km(lat, lon, region["lat"], region["lon"])
-        if d < best_dist:
-            best, best_dist = region, d
-    return best, best_dist
+def nearby_regions(regions: list, normals: dict, lat: float, lon: float) -> list[tuple[dict, float, float]]:
+    """(region, distance in km, weight) of the stations a place is averaged
+    from, nearest first. The nearest is always one of them, also before its
+    data is computed; the others only when within BLEND_KM and computed."""
+    by_distance = sorted(((haversine_km(lat, lon, r["lat"], r["lon"]), r) for r in regions), key=lambda t: t[0])
+    if not by_distance:
+        return []
+    used = [by_distance[0]]
+    for d, r in by_distance[1:]:
+        if len(used) == BLEND_STATIONS or d > BLEND_KM:
+            break
+        if r["region_id"] in normals:
+            used.append((d, r))
+    raw = [1 / max(d, 1.0) ** 2 for d, _ in used]
+    return [(r, d, w / sum(raw)) for (d, r), w in zip(used, raw)]
+
+
+def blended_day(normals: dict, used: list, day: int) -> dict | None:
+    """One day's normals averaged over the stations in use: each window
+    (p_long/p30/p10) of each variable, weighted. A variable only when every
+    station has it that day; None when the nearest has no data for it."""
+    entries = [(normals.get(r["region_id"], {}).get("days", {}).get(str(day)), w) for r, _, w in used]
+    if not entries or entries[0][0] is None:
+        return None
+    present = [(e, w) for e, w in entries if e is not None]
+    total = sum(w for _, w in present)
+    out = {}
+    for var in ("temp", "precip", "wind"):
+        if all(var in e for e, _ in present):
+            out[var] = {k: round(sum(e[var][k] * w for e, w in present) / total, 1) for k in ("p_long", "p30", "p10")}
+    return out
 
 
 def trend_weight(horizon_days: int) -> float:
@@ -125,11 +159,11 @@ def normals_day(d: date) -> int:
     return date(2024, d.month, d.day).timetuple().tm_yday
 
 
-def region_blend_for_date(region: dict, d: date, weights: dict, var: str = "temp") -> float | None:
-    """Same as variable_blend, but looks up an arbitrary date within the
-    same region first -- used to compute how far the recent forecast
-    deviates from normal, for dates other than the one being requested."""
-    day_data = region["days"].get(str(normals_day(d)))
+def blend_for_date(normals: dict, used: list, d: date, weights: dict, var: str = "temp") -> float | None:
+    """Same as variable_blend, but for an arbitrary date at the same place --
+    used to compute how far the recent forecast deviates from normal, for
+    dates other than the one being requested."""
+    day_data = blended_day(normals, used, normals_day(d))
     if day_data is None:
         return None
     return variable_blend(day_data, var, weights)
@@ -173,6 +207,10 @@ class handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
+        if not authorized(self.headers):
+            self._json_response(401, {"error": "This API is not public."})
+            return
+
         if not check_rate_limit(client_ip(self.headers)):
             self._json_response(429, {
                 "error": "Rate limit exceeded (max 60 requests/minute per IP).",
@@ -204,15 +242,15 @@ class handler(BaseHTTPRequestHandler):
             day_of_year = normals_day(target_date)
 
             regions = load_regions()
-            nearest, distance_km = nearest_region(regions, lat, lon)
-            if nearest is None:
+            normals = load_normals()
+            used = nearby_regions(regions, normals, lat, lon)
+            if not used:
                 self._json_response(404, {"error": "no known region at all (empty regions.json)"})
                 return
+            nearest, distance_km = used[0][0], used[0][1]
             region_id = nearest["region_id"]
-
-            normals = load_normals()
             region = normals.get(region_id)
-            day_data = region["days"].get(str(day_of_year)) if region else None
+            day_data = blended_day(normals, used, day_of_year)
 
             if day_data is None:
                 self._json_response(202, {
@@ -276,7 +314,7 @@ class handler(BaseHTTPRequestHandler):
                             d = date.today() + timedelta(days=offset)
                             fc = forecast.get(d.isoformat())
                             fc_temp = fc.get("temp") if fc else None
-                            normal_temp = region_blend_for_date(region, d, weights, "temp")
+                            normal_temp = blend_for_date(normals, used, d, weights, "temp")
                             if fc_temp is not None and normal_temp is not None:
                                 anomalies.append(fc_temp - normal_temp)
                         if anomalies:
@@ -294,6 +332,10 @@ class handler(BaseHTTPRequestHandler):
                 "region": region_id,
                 "region_meta": region["meta"],
                 "distance_to_reference_station_km": round(distance_km, 1),
+                "stations": [
+                    {"region": r["region_id"], "station_name": r["station_name"], "km": round(d, 1), "weight": round(w, 3)}
+                    for r, d, w in used
+                ],
                 "date": target_date.isoformat(),
                 "weights_used": weights,
                 "temp": resp_temp,
@@ -312,10 +354,11 @@ class handler(BaseHTTPRequestHandler):
         payload = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if not API_KEYS:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(payload)))
         if cache:
-            self.send_header("Cache-Control", CACHE_CONTROL)
+            self.send_header("Cache-Control", PRIVATE_CACHE_CONTROL if API_KEYS else CACHE_CONTROL)
         if retry_after is not None:
             self.send_header("Retry-After", str(retry_after))
         self.end_headers()

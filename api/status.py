@@ -11,9 +11,14 @@ that already have temp. Useful to poll while the incremental build
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+
+# See normal.py: a sibling import needs its directory on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _shared import API_KEYS, authorized  # noqa: E402
 
 NORMALS_PATH = Path(__file__).resolve().parent.parent / "normals.json"
 REGIONS_PATH = Path(__file__).resolve().parent.parent / "dev" / "regions.json"
@@ -45,6 +50,9 @@ def has_precip_wind(entry: dict) -> bool:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if not authorized(self.headers):
+            self._send(401, {"error": "This API is not public."})
+            return
         regions = load_regions()
         normals = load_normals()
 
@@ -67,11 +75,16 @@ class handler(BaseHTTPRequestHandler):
             },
         }
 
+        self._send(200, body)
+
+    def _send(self, status: int, body: dict):
         payload = json.dumps(body).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if not API_KEYS:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "public, max-age=300")
+        # With keys the CDN may not keep it: it would hand it to callers without a key.
+        self.send_header("Cache-Control", "private, max-age=300" if API_KEYS else "public, max-age=300")
         self.end_headers()
         self.wfile.write(payload)
