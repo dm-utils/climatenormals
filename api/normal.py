@@ -118,11 +118,18 @@ def variable_blend(day_data: dict, var: str, weights: dict) -> float | None:
     return weights["p_long"] * v["p_long"] + weights["p30"] * v["p30"] + weights["p10"] * v["p10"]
 
 
+def normals_day(d: date) -> int:
+    """The key of a date in normals.json: its day of the year in 2024, the leap year
+    the normals were built for. In an ordinary year 1 March is day 60, but in the
+    normals it is day 61 (day 60 is 29 February)."""
+    return date(2024, d.month, d.day).timetuple().tm_yday
+
+
 def region_blend_for_date(region: dict, d: date, weights: dict, var: str = "temp") -> float | None:
     """Same as variable_blend, but looks up an arbitrary date within the
     same region first -- used to compute how far the recent forecast
     deviates from normal, for dates other than the one being requested."""
-    day_data = region["days"].get(str(d.timetuple().tm_yday))
+    day_data = region["days"].get(str(normals_day(d)))
     if day_data is None:
         return None
     return variable_blend(day_data, var, weights)
@@ -194,7 +201,7 @@ class handler(BaseHTTPRequestHandler):
                 if "date" in params
                 else date.today()
             )
-            day_of_year = target_date.timetuple().tm_yday
+            day_of_year = normals_day(target_date)
 
             regions = load_regions()
             nearest, distance_km = nearest_region(regions, lat, lon)
