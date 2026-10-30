@@ -54,6 +54,14 @@ instead of hitting the rate limit in one burst.
 
 Check progress any time: `GET /api/status` (or `dev/batch_log.txt` locally).
 
+## Day details
+
+`details/<region_id>.json`, built by `dev/build_details.py` from the station
+records alone (no Open-Meteo requests; run it again at any time): for every
+day of the year and each period the average daytime high and night low and
+the range of highs on 8 days in 10, the warmest day and coldest night on
+record, the warming trend since 1950 (°C per decade) and averages per decade.
+
 ## API
 
 - `GET /api/normal?lat=&lon=&date=` or `?address=&date=` — the climate normal
