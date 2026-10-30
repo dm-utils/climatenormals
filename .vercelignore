@@ -2,3 +2,4 @@ dev/data
 dev/*.log
 dev/batch_log.txt
 details
+dev/era5_temp.json

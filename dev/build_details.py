@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import json
 import statistics
+import sys
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
@@ -37,6 +38,8 @@ TREND_MIN_YEARS = 30
 # A year counts for the trend when most days around the date were measured.
 MIN_DAYS_IN_WINDOW = 2 * WINDOW_DAYS + 1 - 5
 MIN_YEARS_IN_DECADE = 5
+# A recent period only from the station when it measured most of its years (as correct_normals.py does).
+MIN_YEARS = {"p_long": 1, "p30": 20, "p10": 8}
 
 
 def period_of(year: int) -> str:
@@ -78,7 +81,13 @@ def r1(v: float) -> float:
 def day_details(highs: dict, lows: dict, target: date) -> dict | None:
     wanted = day_window(target, WINDOW_DAYS)
     out: dict = {"w": {}}
+    per_year: dict = defaultdict(int)
+    for k in wanted:
+        for y in highs.get(k, {}):
+            per_year[y] += 1
     for period in ("p_long", "p30", "p10"):
+        if sum(1 for y, n in per_year.items() if period_of(y) == period and n >= MIN_DAYS_IN_WINDOW) < MIN_YEARS[period]:
+            continue
         hi = sorted(v for k in wanted for y, v in highs.get(k, {}).items() if period_of(y) == period)
         lo = [v for k in wanted for y, v in lows.get(k, {}).items() if period_of(y) == period]
         if hi and lo:
@@ -113,6 +122,7 @@ def day_details(highs: dict, lows: dict, target: date) -> dict | None:
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     regions = json.loads(REGIONS.read_text(encoding="utf-8"))
     OUT_DIR.mkdir(exist_ok=True)
     days = all_days_of_year()

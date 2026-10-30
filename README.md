@@ -15,8 +15,9 @@ Data sources:
   project history; `dev/regions.json` has the final per-region station
   assignments (one representative long-record station per admin-1 region,
   found via reverse-geocoding every qualifying station against Nominatim/OSM).
-- **Recent windows (30y/10y)**: [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)
-  (ERA5 reanalysis), one 30-year `temperature_2m_max` fetch per region.
+- **Recent windows (30y/10y)**: the same station records where they cover
+  the period; otherwise [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)
+  (ERA5 reanalysis), corrected to the station (see below).
 
 ## Architecture
 
@@ -53,6 +54,19 @@ scheduled hourly, spreading the full build over roughly a day and a half
 instead of hitting the rate limit in one burst.
 
 Check progress any time: `GET /api/status` (or `dev/batch_log.txt` locally).
+
+## Temperature from the stations
+
+ERA5 runs cooler than the stations: 0.7-1.1 °C on average and up to 4-5 °C
+in mountains and on islands, which made a station-based long window and
+ERA5-based recent windows incomparable. `dev/correct_normals.py` therefore
+takes the temperature of the 30y and 10y windows from the station itself when
+it measured most of their years (20 of 30, 8 of 10), and otherwise adds the
+station-minus-ERA5 difference over a window where both exist (smoothed over a
+month) to ERA5. Per region `meta.recent_source` says what most days come from
+(`station`, `era5_corrected` or `era5`). It reads only `dev/data` and the raw
+ERA5 values it keeps in `dev/era5_temp.json`, so it can be run again at any
+time.
 
 ## Day details
 
